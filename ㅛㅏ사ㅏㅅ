@@ -1,0 +1,1456 @@
+name: Build Violet Lite (AI 추천 + 번역)
+on:
+  push:
+  workflow_dispatch:
+jobs:
+ build:
+  runs-on: ubuntu-latest
+  permissions:
+   contents: write
+  defaults:
+   run:
+    working-directory: violet
+  steps:
+  - uses: actions/checkout@v4
+  - name: Add taste recommend page
+    run: |
+     cat > lib/pages/bookmark/taste_recommend_page.dart <<'DART'
+     import 'dart:math';
+     import 'package:flutter/material.dart';
+     import 'package:provider/provider.dart';
+     import 'package:shared_preferences/shared_preferences.dart';
+     import 'package:violet/algorithm/distance.dart';
+     import 'package:violet/component/hitomi/hybrid_loader.dart';
+     import 'package:violet/component/index.dart';
+     import 'package:violet/component/query_translate.dart';
+     import 'package:violet/database/database.dart';
+     import 'package:violet/database/query.dart';
+     import 'package:violet/database/user/bookmark.dart';
+     import 'package:violet/database/user/record.dart';
+     import 'package:violet/model/article_list_item.dart';
+     import 'package:violet/settings/settings.dart';
+     import 'package:violet/widgets/article_item/article_list_item_widget.dart';
+     class TasteRecommendPage extends StatefulWidget {
+     const TasteRecommendPage({super.key});
+     @override
+     State<TasteRecommendPage> createState() => _TasteRecommendPageState();
+     }
+     enum _Mode { taste, recent }
+     class _Cand {
+     _Cand(this.id, this.q, this.score, this.reason);
+     final int id;
+     final QueryResult q;
+     final double score;
+     final String reason;
+     }
+     class _Profile {
+     final Map<String, double> weights = {};
+     final Map<String, dynamic> vec = {};
+     List<(String, ArtistType)> artists = [];
+     final List<(String, ArtistType, double, String)> similar = [];
+     final Map<int, _Cand> pool = {};
+     bool built = false;
+     bool similarComputed = false;
+     int sourceCount = 0;
+     }
+     class _TasteRecommendPageState extends State<TasteRecommendPage> {
+     static const int _kResultCount = 20;
+     static const int _kProfileArticleLimit = 80;
+     static const int _kRecentLimit = 30;
+     static const int _kNetworkFetchLimit = 12;
+     static const int _kChunkSize = 300;
+     static const int _kKeepPerChunk = 25;
+     static const int _kMaxArtistSourcePerDraw = 7;
+     static const int _kMaxSimilarPerDraw = 7;
+     static const int _kMaxPerArtist = 2;
+     static const int _kSeenKeep = 400;
+     static const String _kSeenKey = 'ai_recommend_seen_ids';
+     final Random _rand = Random();
+     _Mode _mode = _Mode.taste;
+     final Map<_Mode, _Profile> _profiles = {
+     _Mode.taste: _Profile(),
+     _Mode.recent: _Profile(),
+     };
+     _Profile get _p => _profiles[_mode]!;
+     bool _loading = true;
+     final Set<_Mode> _fillingModes = {};
+     bool get _filling => _fillingModes.contains(_mode);
+     String _status = '';
+     String? _message;
+     String _drawInfo = '';
+     final Set<int> _bookmarkedIds = {};
+     final Set<int> _readIds = {};
+     final List<int> _recentReadIds = [];
+     final Set<int> _shownIds = {};
+     final List<int> _seenOrder = [];
+     List<(String, ArtistType)> _favArtists = [];
+     Set<String> _excluded = {};
+     int _rollCount = 0;
+     int? _minId;
+     int? _maxId;
+     List<_Cand> _results = [];
+     bool get _hasDb => _minId != null && _maxId != null && _maxId! > _minId!;
+     @override
+     void initState() {
+     super.initState();
+     _init();
+     }
+     void _setStatus(String s) {
+     if (mounted) setState(() => _status = s);
+     }
+     Future<void> _step(String status, Future<void> Function() job) async {
+     if (!mounted) return;
+     _setStatus(status);
+     try {
+     await job().timeout(const Duration(seconds: 20));
+     } catch (_) {}
+     }
+     Future<void> _init() async {
+     try {
+     _setStatus('기록 불러오는 중...');
+     await _loadSeen();
+     await _loadIdRange();
+     await _loadBase();
+     } catch (e) {
+     if (!mounted) return;
+     setState(() {
+     _loading = false;
+     _message = '정보를 불러오지 못했어요.\n$e';
+     });
+     return;
+     }
+     await _enterMode(_Mode.taste);
+     }
+     String _norm(String s) => s
+     .trim()
+     .toLowerCase()
+     .replaceAll(' ', '_')
+     .replaceFirst(RegExp(r'^tag:'), '');
+     String _tokenOf(String group, String name) {
+     final n = _norm(name);
+     if (n.isEmpty) return '';
+     return (group == 'female' || group == 'male') ? '$group:$n' : n;
+     }
+     bool _isExcluded(String token) {
+     if (_excluded.contains(token)) return true;
+     final i = token.indexOf(':');
+     return i >= 0 && _excluded.contains(token.substring(i + 1));
+     }
+     List<(String, String)> _tagsOf(QueryResult m) {
+     try {
+     return m.tagList();
+     } catch (_) {
+     return const [];
+     }
+     }
+     bool _hasExcluded(QueryResult m) =>
+     _tagsOf(m).any((t) => _isExcluded(_tokenOf(t.$1, t.$2)));
+     int? _idOf(QueryResult q) => int.tryParse('${q.result['Id']}');
+     bool _isNew(int id) =>
+     !_bookmarkedIds.contains(id) &&
+     !_readIds.contains(id) &&
+     !_shownIds.contains(id);
+     List<String> _splitNames(dynamic s) => '${s ?? ''}'
+     .split('|')
+     .map((e) => e.trim())
+     .where((e) => e.isNotEmpty && e != 'n/a')
+     .toList();
+     String _mainArtist(QueryResult q) {
+     final a = _splitNames(q.artists());
+     if (a.isNotEmpty) return a.first;
+     final g = _splitNames(q.groups());
+     return g.isNotEmpty ? g.first : '';
+     }
+     String _lang() {
+     final langs = HybridLoader.getSelectedLanguages();
+     return langs.length == 1 ? langs.first : 'all';
+     }
+     Future<void> _loadSeen() async {
+     try {
+     final prefs = await SharedPreferences.getInstance();
+     for (final s in prefs.getStringList(_kSeenKey) ?? const <String>[]) {
+     final id = int.tryParse(s);
+     if (id != null && _shownIds.add(id)) _seenOrder.add(id);
+     }
+     } catch (_) {}
+     }
+     Future<void> _saveSeen() async {
+     try {
+     if (_seenOrder.length > _kSeenKeep) {
+     _seenOrder.removeRange(0, _seenOrder.length - _kSeenKeep);
+     }
+     final prefs = await SharedPreferences.getInstance();
+     await prefs.setStringList(
+     _kSeenKey,
+     _seenOrder.map((e) => '$e').toList(),
+     );
+     } catch (_) {}
+     }
+     Future<void> _loadIdRange() async {
+     try {
+     final db = await DataBaseManager.getInstance();
+     final r = await db
+     .query('SELECT MIN(Id) AS a, MAX(Id) AS b FROM HitomiColumnModel')
+     .timeout(const Duration(seconds: 5));
+     if (r.isNotEmpty) {
+     _minId = int.tryParse('${r.first['a']}');
+     _maxId = int.tryParse('${r.first['b']}');
+     }
+     } catch (_) {}
+     }
+     Future<void> _loadBase() async {
+     _excluded = Settings.excludeTags.value
+     .map(_norm)
+     .where((e) => e.isNotEmpty)
+     .toSet();
+     final bookmark = await Bookmark.getInstance();
+     for (final a in await bookmark.getArticle()) {
+     final id = int.tryParse(a.article().trim());
+     if (id != null) _bookmarkedIds.add(id);
+     }
+     try {
+     final artists = await bookmark.getArtist();
+     _favArtists = artists.map((a) => (a.artist(), a.type())).toList();
+     } catch (_) {
+     _favArtists = [];
+     }
+     try {
+     final logs = await (await User.getInstance()).getUserLog();
+     for (final log in logs) {
+     final id = int.tryParse('${log.result['Article']}');
+     if (id != null && _readIds.add(id)) _recentReadIds.add(id);
+     }
+     } catch (_) {}
+     }
+     void _addTags(_Profile p, QueryResult m, double w) {
+     final seen = <String>{};
+     for (final (group, name) in _tagsOf(m)) {
+     final token = _tokenOf(group, name);
+     if (token.isEmpty || _isExcluded(token) || !seen.add(token)) continue;
+     p.weights[token] = (p.weights[token] ?? 0) + w;
+     }
+     }
+     void _buildVec(_Profile p) {
+     p.vec.clear();
+     p.weights.forEach((token, w) {
+     final key = HentaiIndex.tagIndex[token.replaceAll('_', ' ')];
+     if (key != null) p.vec[key.toString()] = w;
+     });
+     }
+     Future<void> _buildTasteProfile(_Profile p) async {
+     _setStatus('북마크 분석 중...');
+     final sample = _bookmarkedIds.toList()..shuffle(_rand);
+     final metas = await _loadMetadata(
+     sample.take(_kProfileArticleLimit).toList(),
+     maxNetwork: _kNetworkFetchLimit,
+     );
+     p.sourceCount = metas.length;
+     for (final m in metas.values) {
+     _addTags(p, m, 1.0);
+     }
+     for (final raw in Settings.favoriteTags.value) {
+     final token = _norm(raw);
+     if (token.isEmpty || _isExcluded(token)) continue;
+     p.weights[token] = (p.weights[token] ?? 0) + 3.0;
+     }
+     p.artists = List.of(_favArtists);
+     _buildVec(p);
+     }
+     Future<void> _buildRecentProfile(_Profile p) async {
+     _setStatus('최근 본 작품 분석 중...');
+     final recent = _recentReadIds.take(_kRecentLimit).toList();
+     final metas = await _loadMetadata(recent, maxNetwork: _kNetworkFetchLimit);
+     p.sourceCount = metas.length;
+     final artistW = <(String, ArtistType), double>{};
+     for (var i = 0; i < recent.length; i++) {
+     final m = metas[recent[i]];
+     if (m == null) continue;
+     final w = 1.0 / (1.0 + i / 8.0); // 최근에 본 것일수록 크게
+     _addTags(p, m, w);
+     for (final a in _splitNames(m.artists())) {
+     final k = (a, ArtistType.artist);
+     artistW[k] = (artistW[k] ?? 0) + w;
+     }
+     for (final g in _splitNames(m.groups())) {
+     final k = (g, ArtistType.group);
+     artistW[k] = (artistW[k] ?? 0) + w;
+     }
+     }
+     final ranked = artistW.entries.toList()
+     ..sort((a, b) => b.value.compareTo(a.value));
+     p.artists = ranked.take(10).map((e) => e.key).toList();
+     _buildVec(p);
+     }
+     double _score(_Profile p, QueryResult m) {
+     final tags = _tagsOf(m);
+     if (tags.isEmpty) return 0;
+     var s = 0.0;
+     for (final (group, name) in tags) {
+     final w = p.weights[_tokenOf(group, name)];
+     if (w != null) s += sqrt(w);
+     }
+     return s / sqrt(tags.length);
+     }
+     void _addCand(_Profile p, QueryResult q, double bonus, String reason) {
+     final id = _idOf(q);
+     if (id == null || !_isNew(id) || _hasExcluded(q)) return;
+     final score = _score(p, q) + bonus;
+     final old = p.pool[id];
+     if (old == null || score > old.score) {
+     p.pool[id] = _Cand(id, q, score, reason);
+     }
+     }
+     int _available(_Profile p) => p.pool.keys.where(_isNew).length;
+     String _withFilters(String tokens) => translate2query(
+     '$tokens ${Settings.includeTags.value} ${Settings.serializedExcludeTags}'
+     .trim(),
+     );
+     Future<List<QueryResult>> _localQuery(
+     String tokens, {
+     required int limit,
+     required int maxPage,
+     }) async {
+     try {
+     final sql = _withFilters(tokens);
+     var page = maxPage <= 1 ? 0 : _rand.nextInt(maxPage);
+     for (var i = 0; i < 3; i++) {
+     final qm = QueryManager.queryPagination(sql, limit);
+     qm.curPage = page;
+     final list = await qm.next().timeout(const Duration(seconds: 10));
+     if (list.isNotEmpty || page == 0) return list;
+     page = page ~/ 4;
+     }
+     } catch (_) {}
+     return [];
+     }
+     String _tagLabel(_Mode mode) =>
+     mode == _Mode.taste ? '취향 태그' : '최근 본 작품과 비슷함';
+     Future<void> _quickFill(_Profile p, _Mode mode, int chunks) async {
+     if (!_hasDb || p.weights.isEmpty) return;
+     final span = (_maxId! - _minId!).toDouble();
+     for (var i = 0; i < chunks; i++) {
+     final before = _maxId! + 1 - (span * pow(_rand.nextDouble(), 2)).toInt();
+     var sql = _withFilters('');
+     sql += sql.contains('WHERE') ? ' AND Id < $before' : ' WHERE Id < $before';
+     List<QueryResult> rows;
+     try {
+     rows = await QueryManager.queryPagination(
+     sql,
+     _kChunkSize,
+     ).next().timeout(const Duration(seconds: 8));
+     } catch (_) {
+     continue;
+     }
+     final scored = <(QueryResult, double)>[];
+     for (final q in rows) {
+     final s = _score(p, q);
+     if (s > 0) scored.add((q, s));
+     }
+     scored.sort((a, b) => b.$2.compareTo(a.$2));
+     for (final (q, _) in scored.take(_kKeepPerChunk)) {
+     _addCand(p, q, 0, _tagLabel(mode));
+     }
+     }
+     }
+     String? _pickToken(_Profile p) {
+     final entries = p.weights.entries.toList();
+     if (entries.isEmpty) return null;
+     final ws = entries.map((e) => sqrt(e.value)).toList();
+     var r = _rand.nextDouble() * ws.fold<double>(0, (a, b) => a + b);
+     for (var i = 0; i < entries.length; i++) {
+     r -= ws[i];
+     if (r <= 0) return entries[i].key;
+     }
+     return entries.last.key;
+     }
+     Future<void> _fillTags(_Profile p, _Mode mode, int n) async {
+     final tried = <String>{};
+     for (var k = 0; k < n; k++) {
+     final token = _pickToken(p);
+     if (token == null) return;
+     if (!tried.add(token)) continue;
+     if (_hasDb) {
+     for (final q in await _localQuery(token, limit: 30, maxPage: 15)) {
+     _addCand(p, q, 0.5, '${_tagLabel(mode)}: $token');
+     }
+     } else {
+     final ids = await _fetchIds(token);
+     final fresh = ids.where(_isNew).toList()..shuffle(_rand);
+     final metas = await _loadMetadata(
+     fresh.take(12).toList(),
+     maxNetwork: 12,
+     );
+     for (final q in metas.values) {
+     _addCand(p, q, 0.5, '${_tagLabel(mode)}: $token');
+     }
+     }
+     }
+     }
+     bool _safeName(String n) =>
+     n.isNotEmpty &&
+     !n.contains("'") &&
+     !n.contains('"') &&
+     !n.contains('(') &&
+     !n.contains(')');
+     String _orTokens(Iterable<(String, ArtistType)> list) =>
+     '(${list.map((e) => '${e.$2.name}:${e.$1.replaceAll(' ', '_')}').join(' or ')})';
+     String? _matchName(QueryResult q, Iterable<String> names) {
+     final hay =
+     '|${q.artists()}|${q.groups() ?? ''}|'
+     '${q.result['Series'] ?? ''}|${q.result['Characters'] ?? ''}|'
+     .toLowerCase();
+     for (final n in names) {
+     if (hay.contains('|${n.toLowerCase()}|')) return n;
+     }
+     return null;
+     }
+     Future<List<QueryResult>> _networkArtists(
+     Iterable<(String, ArtistType)> list,
+     ) async {
+     final out = <QueryResult>[];
+     for (final (name, type) in list) {
+     try {
+     final r = await HybridLoader.fetchArtistArticlesHybrid(
+     name: name,
+     type: type.name,
+     language: _lang(),
+     ).timeout(const Duration(seconds: 15));
+     out.addAll((List<QueryResult>.of(r)..shuffle(_rand)).take(10));
+     } catch (_) {}
+     }
+     return out;
+     }
+     Future<void> _fillArtists(_Profile p, _Mode mode) async {
+     final list = p.artists.where((e) => _safeName(e.$1)).toList();
+     if (mode == _Mode.taste) list.shuffle(_rand);
+     if (list.isEmpty) return;
+     final use = list.take(20).toList();
+     final rows = _hasDb
+     ? await _localQuery(_orTokens(use), limit: 60, maxPage: 5)
+     : await _networkArtists(use.take(3));
+     final names = use.map((e) => e.$1).toList();
+     final label = mode == _Mode.taste ? '즐겨찾는 작가' : '최근 본 작가';
+     for (final q in rows) {
+     final who = _matchName(q, names);
+     _addCand(
+     p,
+     q,
+     mode == _Mode.taste ? 3.0 : 2.0,
+     who == null ? label : '$label: $who',
+     );
+     }
+     }
+     Future<void> _computeSimilar(_Profile p, _Mode mode) async {
+     if (p.similarComputed) return;
+     p.similarComputed = true;
+     final own = {...p.artists.map((e) => e.$1), ..._favArtists.map((e) => e.$1)};
+     final cand = <String, (ArtistType, double, String)>{};
+     final picks = p.artists
+     .where((e) => e.$2 == ArtistType.artist || e.$2 == ArtistType.group)
+     .toList();
+     if (mode == _Mode.taste) picks.shuffle(_rand);
+     for (final (name, type) in picks.take(4)) {
+     await Future<void>.delayed(Duration.zero);
+     final isGroup = type == ArtistType.group;
+     List<(String, double)> sims = [];
+     try {
+     sims = isGroup
+     ? HentaiIndex.calculateSimilarGroups(name)
+     : HentaiIndex.calculateSimilarArtists(name);
+     } catch (_) {}
+     final vecs = isGroup ? HentaiIndex.tagGroup : HentaiIndex.tagArtist;
+     for (final (other, baseSim) in sims.take(12)) {
+     if (own.contains(other) ||
+     cand.containsKey(other) ||
+     !_safeName(other)) {
+     continue;
+     }
+     var rank = baseSim;
+     final vec = vecs[other];
+     if (p.vec.isNotEmpty && vec is Map<String, dynamic>) {
+     rank = Distance.cosineDistance(p.vec, vec);
+     }
+     cand[other] = (type, rank, name);
+     }
+     }
+     final ranked = cand.entries.where((e) => e.value.$2 > 0).toList()
+     ..sort((a, b) => b.value.$2.compareTo(a.value.$2));
+     p.similar
+     ..clear()
+     ..addAll(
+     ranked
+     .take(10)
+     .map((e) => (e.key, e.value.$1, e.value.$2, e.value.$3)),
+     );
+     }
+     Future<void> _fillSimilar(_Profile p, _Mode mode) async {
+     await _computeSimilar(p, mode);
+     if (p.similar.isEmpty) return;
+     final pick = (List.of(p.similar)..shuffle(_rand)).take(8).toList();
+     final pairs = pick.map((e) => (e.$1, e.$2));
+     final rows = _hasDb
+     ? await _localQuery(_orTokens(pairs), limit: 60, maxPage: 5)
+     : await _networkArtists(pairs.take(3));
+     final names = pick.map((e) => e.$1).toList();
+     for (final q in rows) {
+     final who = _matchName(q, names);
+     if (who == null) continue;
+     final info = pick.firstWhere((e) => e.$1 == who);
+     _addCand(
+     p,
+     q,
+     1.0 + info.$3 / 100 * 2.0,
+     '비슷한 작가: $who (${info.$4} 기준)',
+     );
+     }
+     }
+     Future<void> _backgroundFill(_Mode mode) async {
+     if (!_fillingModes.add(mode)) return;
+     final p = _profiles[mode]!;
+     if (mounted) setState(() {});
+     try {
+     await _fillTags(p, mode, 3);
+     await _quickFill(p, mode, 4);
+     await _fillArtists(p, mode);
+     await _fillSimilar(p, mode);
+     } catch (_) {
+     } finally {
+     _fillingModes.remove(mode);
+     if (mounted) {
+     if (_mode == mode && !_loading && _results.isEmpty) {
+     _draw();
+     } else {
+     setState(() {});
+     }
+     }
+     }
+     }
+     Future<Map<int, QueryResult>> _loadMetadata(
+     List<int> ids, {
+     required int maxNetwork,
+     }) async {
+     final out = <int, QueryResult>{};
+     if (ids.isEmpty) return out;
+     try {
+     final local = await QueryManager.queryIds(
+     ids,
+     ).timeout(const Duration(seconds: 8));
+     for (final q in local) {
+     final id = _idOf(q);
+     if (id != null) out[id] = q;
+     }
+     } catch (_) {}
+     var rest = ids.where((e) => !out.containsKey(e)).toList();
+     if (rest.isNotEmpty) {
+     try {
+     out.addAll(
+     await HybridLoader.getCachedMetadataBatch(
+     rest,
+     ).timeout(const Duration(seconds: 8)),
+     );
+     } catch (_) {}
+     }
+     rest = ids.where((e) => !out.containsKey(e)).take(maxNetwork).toList();
+     for (var i = 0; i < rest.length; i += 6) {
+     final chunk = rest.skip(i).take(6).toList();
+     final fetched = await Future.wait(
+     chunk.map((id) async {
+     try {
+     return await HybridLoader.idQueryHitomiFast(
+     id,
+     ).timeout(const Duration(seconds: 6));
+     } catch (_) {
+     return null;
+     }
+     }),
+     );
+     for (var j = 0; j < chunk.length; j++) {
+     final q = fetched[j];
+     if (q != null) out[chunk[j]] = q;
+     }
+     }
+     return out;
+     }
+     Future<List<int>> _fetchIds(String token) async {
+     var maxPage = 12;
+     for (var i = 0; i < 3; i++) {
+     final page = _rand.nextInt(maxPage);
+     try {
+     final ids = await HybridLoader.fetchGalleryIdsForQuery(
+     query: token,
+     page: page,
+     pageSize: 30,
+     targetLang: _lang(),
+     ).timeout(const Duration(seconds: 15));
+     if (ids.isNotEmpty) return ids;
+     } catch (_) {}
+     if (maxPage == 1) break;
+     maxPage = max(1, maxPage ~/ 4);
+     }
+     return [];
+     }
+     Future<void> _enterMode(_Mode mode) async {
+     setState(() {
+     _mode = mode;
+     _loading = true;
+     _results = [];
+     _message = null;
+     _drawInfo = '';
+     });
+     final p = _profiles[mode]!;
+     if (!p.built) {
+     try {
+     if (mode == _Mode.taste) {
+     await _buildTasteProfile(p);
+     } else {
+     await _buildRecentProfile(p);
+     }
+     } catch (_) {}
+     p.built = true;
+     }
+     if (!mounted || _mode != mode) return;
+     if (p.weights.isEmpty && p.artists.isEmpty) {
+     setState(() {
+     _loading = false;
+     _message = mode == _Mode.taste
+     ? '북마크한 작품, 즐겨찾기 태그, 즐겨찾는 작가가 아직 없어요.\n'
+     '마음에 드는 작품을 북마크하면 취향을 계산해서 추천해 드려요.'
+     : '최근 본 작품이 아직 없어요.\n'
+     '작품을 몇 개 보고 오면 비슷한 작품을 추천해 드려요.';
+     });
+     return;
+     }
+     if (_available(p) < _kResultCount) {
+     await _step(
+     '취향에 맞는 작품 찾는 중...',
+     () => _hasDb ? _quickFill(p, mode, 3) : _fillTags(p, mode, 3),
+     );
+     await _step(
+     mode == _Mode.taste ? '즐겨찾는 작가 작품 찾는 중...' : '최근 본 작가 작품 찾는 중...',
+     () => _fillArtists(p, mode),
+     );
+     await _step('비슷한 작가 찾는 중...', () => _fillSimilar(p, mode));
+     }
+     if (!mounted || _mode != mode) return;
+     _backgroundFill(mode);
+     _draw();
+     }
+     void _draw() {
+     final p = _p;
+     final keyed =
+     p.pool.values
+     .where((c) => _isNew(c.id))
+     .map(
+     (c) => (
+     c,
+     pow(_rand.nextDouble(), 1 / max(0.05, c.score)).toDouble(),
+     ),
+     )
+     .toList()
+     ..sort((a, b) => b.$2.compareTo(a.$2));
+     final picked = <_Cand>[];
+     final perArtist = <String, int>{};
+     var art = 0;
+     var sim = 0;
+     for (final (c, _) in keyed) {
+     if (picked.length >= _kResultCount) break;
+     final isArt =
+     c.reason.startsWith('즐겨찾는') || c.reason.startsWith('최근 본 작가');
+     final isSim = c.reason.startsWith('비슷한');
+     if (isArt && art >= _kMaxArtistSourcePerDraw) continue;
+     if (isSim && sim >= _kMaxSimilarPerDraw) continue;
+     final who = _mainArtist(c.q);
+     if (who.isNotEmpty && (perArtist[who] ?? 0) >= _kMaxPerArtist) continue;
+     if (who.isNotEmpty) perArtist[who] = (perArtist[who] ?? 0) + 1;
+     if (isArt) art++;
+     if (isSim) sim++;
+     picked.add(c);
+     }
+     for (final c in picked) {
+     _shownIds.add(c.id);
+     _seenOrder.add(c.id);
+     p.pool.remove(c.id);
+     }
+     _saveSeen();
+     _rollCount++;
+     final artLabel = _mode == _Mode.taste ? '즐겨찾는 작가' : '최근 본 작가';
+     setState(() {
+     _loading = false;
+     _status = '';
+     _results = picked;
+     _drawInfo =
+     '이번 추천: ${_tagLabel(_mode)} ${picked.length - art - sim}개, '
+     '$artLabel $art개, 비슷한 작가 $sim개';
+     _message = picked.isEmpty
+     ? (_filling
+     ? '추천할 작품을 찾는 중이에요.\n잠시만 기다려 주세요.'
+     : '추천할 작품을 찾지 못했어요.\n잠시 후 다시 뽑기를 눌러 보세요.')
+     : null;
+     });
+     }
+     Future<void> _reroll() async {
+     final mode = _mode;
+     final p = _p;
+     if (_available(p) < _kResultCount) {
+     setState(() {
+     _loading = true;
+     _results = [];
+     });
+     await _step(
+     '작품 더 찾는 중...',
+     () => _hasDb ? _quickFill(p, mode, 5) : _fillTags(p, mode, 2),
+     );
+     await _step('작가 작품 더 찾는 중...', () => _fillArtists(p, mode));
+     if (!mounted || _mode != mode) return;
+     }
+     if (_available(p) < 70) _backgroundFill(mode);
+     _draw();
+     }
+     List<String> _topTokens(_Profile p, int n) {
+     final entries = p.weights.entries.toList()
+     ..sort((a, b) => b.value.compareTo(a.value));
+     return entries.take(n).map((e) => e.key).toList();
+     }
+     @override
+     Widget build(BuildContext context) {
+     return Scaffold(
+     appBar: AppBar(title: const Text('AI 추천')),
+     floatingActionButton: FloatingActionButton.extended(
+     heroTag: 'ai-recommend-fab',
+     onPressed: _loading ? null : _reroll,
+     icon: const Icon(Icons.casino_outlined),
+     label: const Text('다시 뽑기'),
+     backgroundColor: Settings.majorColor.value,
+     foregroundColor: Colors.white,
+     ),
+     body: Column(
+     children: [
+     Padding(
+     padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+     child: Row(
+     children: [
+     _modeChip('내 취향', _Mode.taste),
+     const SizedBox(width: 8),
+     _modeChip('최근 본 작품', _Mode.recent),
+     ],
+     ),
+     ),
+     Expanded(child: _buildBody(context)),
+     ],
+     ),
+     );
+     }
+     Widget _modeChip(String label, _Mode mode) {
+     return ChoiceChip(
+     label: Text(label),
+     selected: _mode == mode,
+     onSelected: (v) {
+     if (v && _mode != mode) _enterMode(mode);
+     },
+     );
+     }
+     Widget _buildBody(BuildContext context) {
+     if (_loading && _results.isEmpty) {
+     return Center(
+     child: Column(
+     mainAxisSize: MainAxisSize.min,
+     children: [
+     const CircularProgressIndicator(),
+     const SizedBox(height: 16),
+     Text(_status, textAlign: TextAlign.center),
+     ],
+     ),
+     );
+     }
+     if (_message != null) {
+     return Center(
+     child: Padding(
+     padding: const EdgeInsets.all(24),
+     child: Column(
+     mainAxisSize: MainAxisSize.min,
+     children: [
+     if (_filling) ...[
+     const CircularProgressIndicator(),
+     const SizedBox(height: 16),
+     ],
+     Text(_message!, textAlign: TextAlign.center),
+     ],
+     ),
+     ),
+     );
+     }
+     return ListView.builder(
+     key: ValueKey('ai_list_${_mode.name}_$_rollCount'),
+     padding: const EdgeInsets.only(bottom: 96),
+     itemCount: _results.length + 1,
+     itemBuilder: (context, index) {
+     if (index == 0) return _header(context);
+     return _item(context, index - 1);
+     },
+     );
+     }
+     Widget _header(BuildContext context) {
+     final p = _p;
+     final hint = TextStyle(color: Theme.of(context).hintColor, fontSize: 13);
+     final favTagCount = Settings.favoriteTags.value
+     .where((e) => e.trim().isNotEmpty)
+     .length;
+     final summary = _mode == _Mode.taste
+     ? '북마크 ${p.sourceCount}개, 즐겨찾기 태그 $favTagCount개, '
+     '즐겨찾는 작가 ${_favArtists.length}명으로 취향을 계산했어요.'
+     : '최근 본 작품 ${p.sourceCount}개로 요즘 취향을 계산했어요.';
+     return Padding(
+     padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+     child: Column(
+     crossAxisAlignment: CrossAxisAlignment.start,
+     children: [
+     if (_filling) ...[
+     const LinearProgressIndicator(),
+     const SizedBox(height: 6),
+     Text('다음 추천에 쓸 작품을 미리 모으는 중...', style: hint),
+     ],
+     const SizedBox(height: 6),
+     Text(summary, style: hint),
+     const SizedBox(height: 4),
+     Text('자주 나온 태그: ${_topTokens(p, 8).join(', ')}', style: hint),
+     if (p.similar.isNotEmpty) ...[
+     const SizedBox(height: 4),
+     Text(
+     '취향이 비슷한 작가: '
+     '${p.similar.take(5).map((e) => e.$1).join(', ')}',
+     style: hint,
+     ),
+     ],
+     if (_mode == _Mode.taste && _favArtists.isEmpty) ...[
+     const SizedBox(height: 4),
+     Text(
+     '작가 페이지에서 하트를 눌러 작가를 즐겨찾기하면, '
+     '그 작가와 비슷한 작가 작품도 추천돼요.',
+     style: hint,
+     ),
+     ],
+     if (_drawInfo.isNotEmpty) ...[
+     const SizedBox(height: 4),
+     Text(_drawInfo, style: hint),
+     ],
+     ],
+     ),
+     );
+     }
+     Widget _item(BuildContext context, int index) {
+     final c = _results[index];
+     return KeyedSubtree(
+     key: ValueKey('ai_${_mode.name}_${_rollCount}_${c.id}'),
+     child: Column(
+     crossAxisAlignment: CrossAxisAlignment.start,
+     children: [
+     Padding(
+     padding: const EdgeInsets.fromLTRB(14, 6, 14, 0),
+     child: Text(
+     c.reason,
+     style: TextStyle(color: Theme.of(context).hintColor, fontSize: 12),
+     ),
+     ),
+     Provider<ArticleListItem>.value(
+     value: ArticleListItem.fromArticleListItem(
+     queryResult: c.q,
+     showDetail: true,
+     addBottomPadding: true,
+     width: MediaQuery.of(context).size.width - 4.0,
+     thumbnailTag: 'ai_${_mode.name}_${_rollCount}_$index',
+     usableTabList: _results.map((e) => e.q).toList(),
+     ),
+     child: const ArticleListItemWidget(),
+     ),
+     ],
+     ),
+     );
+     }
+     }
+     DART
+  - name: Hook it into the bookmark menu
+    run: |
+     python3 - <<'PY'
+     import sys
+
+     p = 'lib/pages/bookmark/bookmark_page.dart'
+     s = open(p, encoding='utf-8').read()
+     if 'taste_recommend_page.dart' in s:
+         print('bookmark_page.dart already patched')
+         sys.exit(0)
+
+
+     def rep(old, new):
+         global s
+         if s.count(old) != 1:
+             sys.exit('patch anchor not found: ' + old[:60])
+         s = s.replace(old, new)
+
+
+     rep(
+         "import 'package:violet/pages/bookmark/record_view_page.dart';\n",
+         "import 'package:violet/pages/bookmark/record_view_page.dart';\n"
+         "import 'package:violet/pages/bookmark/taste_recommend_page.dart';\n",
+     )
+     rep(
+         "          }),\n        ],\n      ),\n    );\n  }\n\n  _dialButton(",
+         "          }),\n"
+         "          _dialButtonText(Icons.auto_awesome, 'AI 추천', () {\n"
+         "            Navigator.of(context).push(\n"
+         "              MaterialPageRoute(builder: (_) => const TasteRecommendPage()),\n"
+         "            );\n"
+         "          }),\n"
+         "        ],\n      ),\n    );\n  }\n\n  _dialButton(",
+     )
+     HELPER = '''  _dialButtonText(IconData? icon, String label, Function() onTap) {
+         return SpeedDialChild(
+           child: Icon(icon, color: Settings.majorColor.value),
+           backgroundColor: Settings.themeWhat.value
+               ? Settings.themeBlack.value
+                     ? Palette.blackThemeBackground
+                     : Colors.grey.shade800
+               : Colors.white,
+           label: label,
+           labelStyle: TextStyle(
+             fontSize: 14.0,
+             color: Settings.themeWhat.value ? Colors.white : Colors.grey.shade800,
+           ),
+           labelBackgroundColor: Settings.themeWhat.value
+               ? Settings.themeBlack.value
+                     ? Palette.blackThemeBackground
+                     : Colors.grey.shade800
+               : Colors.white,
+           onTap: onTap,
+         );
+       }
+
+     '''
+     rep('  Widget _reorderFutureBuilder(', HELPER + '  Widget _reorderFutureBuilder(')
+     open(p, 'w', encoding='utf-8').write(s)
+     print('bookmark_page.dart patched')
+     PY
+  - name: Add manga translate
+    run: |
+     mkdir -p lib/pages/viewer/translate
+     cat > lib/pages/viewer/translate/manga_translate.dart <<'DART'
+     import 'dart:async';
+     import 'dart:io';
+     import 'dart:math';
+     import 'dart:ui' as ui;
+     import 'package:flutter/material.dart';
+     import 'package:flutter/rendering.dart';
+     import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+     import 'package:google_mlkit_translation/google_mlkit_translation.dart';
+     import 'package:path_provider/path_provider.dart';
+     import 'package:provider/provider.dart';
+     import 'package:violet/component/hitomi/hybrid_loader.dart';
+     import 'package:violet/database/query.dart';
+     import 'package:violet/pages/viewer/viewer_page_provider.dart';
+     enum MangaTranslateMode { off, auto, japanese, chinese, english }
+     class MangaTranslateBox {
+     MangaTranslateBox(this.rect, this.text);
+     final Rect rect;
+     final String text;
+     }
+     class MangaTranslate {
+     MangaTranslate._();
+     static final MangaTranslate instance = MangaTranslate._();
+     final ValueNotifier<MangaTranslateMode> mode = ValueNotifier(
+     MangaTranslateMode.off,
+     );
+     final ValueNotifier<List<MangaTranslateBox>> boxes = ValueNotifier(const []);
+     final ValueNotifier<String> status = ValueNotifier('');
+     final ValueNotifier<String> articleLang = ValueNotifier('');
+     GlobalKey? activeKey;
+     int? _articleId;
+     double dpr = 1.0;
+     Timer? _timer;
+     int _gen = 0;
+     bool _busy = false;
+     final Map<TextRecognitionScript, TextRecognizer> _recognizers = {};
+     final Map<String, OnDeviceTranslator> _translators = {};
+     final Map<String, String> _cache = {};
+     static final RegExp _cjk = RegExp(
+     r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff66-\uff9f]',
+     );
+     static final RegExp _hangul = RegExp(r'[\uac00-\ud7a3]');
+     static final RegExp _latinWord = RegExp(r'[A-Za-z\u00c0-\u024f]{2,}');
+     static const Map<String, String> _latinLangs = {
+     'english': 'en', 'spanish': 'es', 'french': 'fr', 'german': 'de',
+     'italian': 'it', 'portuguese': 'pt', 'vietnamese': 'vi',
+     'indonesian': 'id', 'tagalog': 'tl', 'polish': 'pl', 'dutch': 'nl',
+     'turkish': 'tr', 'hungarian': 'hu', 'czech': 'cs', 'finnish': 'fi',
+     'swedish': 'sv', 'norwegian': 'no', 'danish': 'da', 'romanian': 'ro',
+     'catalan': 'ca', 'estonian': 'et', 'albanian': 'sq', 'slovak': 'sk',
+     'croatian': 'hr', 'lithuanian': 'lt', 'latvian': 'lv', 'slovenian': 'sl',
+     'malay': 'ms', 'esperanto': 'eo', 'galician': 'gl', 'icelandic': 'is',
+     'irish': 'ga', 'welsh': 'cy', 'afrikaans': 'af', 'swahili': 'sw',
+     };
+     static const Map<String, String> _koNames = {
+     'japanese': '일본어', 'chinese': '중국어', 'english': '영어',
+     'korean': '한국어', 'spanish': '스페인어', 'french': '프랑스어',
+     'german': '독일어', 'italian': '이탈리아어', 'portuguese': '포르투갈어',
+     'vietnamese': '베트남어', 'indonesian': '인도네시아어', 'russian': '러시아어',
+     'thai': '태국어', 'polish': '폴란드어', 'tagalog': '타갈로그어',
+     'turkish': '터키어', 'dutch': '네덜란드어', 'arabic': '아랍어',
+     'ukrainian': '우크라이나어', 'greek': '그리스어',
+     };
+     static String koName(String lang) => _koNames[lang] ?? lang;
+     Future<void> setArticle(int id) async {
+     if (_articleId == id) return;
+     _articleId = id;
+     articleLang.value = '';
+     String lang = '';
+     try {
+     final local = await QueryManager.queryIds([id]).timeout(
+     const Duration(seconds: 5),
+     );
+     if (local.isNotEmpty) lang = '${local.first.result['Language'] ?? ''}';
+     } catch (_) {}
+     if (lang.isEmpty) {
+     try {
+     final cached = await HybridLoader.getCachedMetadataBatch([id]).timeout(
+     const Duration(seconds: 5),
+     );
+     final q = cached[id];
+     if (q != null) lang = '${q.result['Language'] ?? ''}';
+     } catch (_) {}
+     }
+     if (lang.isEmpty) {
+     try {
+     final q = await HybridLoader.idQueryHitomiFast(id).timeout(
+     const Duration(seconds: 8),
+     );
+     lang = '${q.result['Language'] ?? ''}';
+     } catch (_) {}
+     }
+     if (_articleId != id) return;
+     articleLang.value = lang.trim().toLowerCase();
+     }
+     (TextRecognitionScript, String)? _source(MangaTranslateMode m) {
+     switch (m) {
+     case MangaTranslateMode.off:
+     return null;
+     case MangaTranslateMode.japanese:
+     return (TextRecognitionScript.japanese, 'ja');
+     case MangaTranslateMode.chinese:
+     return (TextRecognitionScript.chinese, 'zh');
+     case MangaTranslateMode.english:
+     return (TextRecognitionScript.latin, 'en');
+     case MangaTranslateMode.auto:
+     final lang = articleLang.value;
+     if (lang.isEmpty || lang == 'n/a' || lang == 'japanese') {
+     return (TextRecognitionScript.japanese, 'ja');
+     }
+     if (lang == 'chinese') return (TextRecognitionScript.chinese, 'zh');
+     final code = _latinLangs[lang];
+     if (code != null) return (TextRecognitionScript.latin, code);
+     return null;
+     }
+     }
+     void cycle() {
+     final values = MangaTranslateMode.values;
+     mode.value = values[(mode.value.index + 1) % values.length];
+     hide();
+     status.value = '';
+     if (mode.value != MangaTranslateMode.off) {
+     schedule(const Duration(milliseconds: 150));
+     }
+     }
+     void hide() {
+     _gen++;
+     _timer?.cancel();
+     if (boxes.value.isNotEmpty) boxes.value = const [];
+     }
+     void schedule([Duration delay = const Duration(milliseconds: 900)]) {
+     if (mode.value == MangaTranslateMode.off) return;
+     _timer?.cancel();
+     _timer = Timer(delay, _run);
+     }
+     TextRecognizer _getRecognizer(TextRecognitionScript script) =>
+     _recognizers.putIfAbsent(script, () => TextRecognizer(script: script));
+     Future<OnDeviceTranslator> _getTranslator(String code) async {
+     final current = _translators[code];
+     if (current != null) return current;
+     final src = TranslateLanguage.values.firstWhere(
+     (e) => e.bcpCode == code,
+     orElse: () => TranslateLanguage.english,
+     );
+     final manager = OnDeviceTranslatorModelManager();
+     for (final lang in [src, TranslateLanguage.korean]) {
+     if (!await manager.isModelDownloaded(lang.bcpCode)) {
+     status.value = '번역 모델 받는 중... (언어마다 처음 한 번만, 수십 MB)';
+     await manager.downloadModel(lang.bcpCode, isWifiRequired: false);
+     }
+     }
+     final created = OnDeviceTranslator(
+     sourceLanguage: src,
+     targetLanguage: TranslateLanguage.korean,
+     );
+     _translators[code] = created;
+     return created;
+     }
+     String? _prepare(String raw, TextRecognitionScript script) {
+     if (_hangul.hasMatch(raw)) return null; // 이미 한국어
+     if (script == TextRecognitionScript.latin) {
+     var s = raw
+     .replaceAll(RegExp(r'-\s*\n\s*'), '')
+     .replaceAll(RegExp(r'\s+'), ' ')
+     .trim();
+     if (!_latinWord.hasMatch(s)) return null;
+     if (s.length > 3 && s == s.toUpperCase()) {
+     s = s.toLowerCase();
+     s = s[0].toUpperCase() + s.substring(1);
+     }
+     return s;
+     }
+     final s = raw.replaceAll(RegExp(r'\s+'), '');
+     return _cjk.hasMatch(s) ? s : null;
+     }
+     Future<void> _run() async {
+     final m = mode.value;
+     if (m == MangaTranslateMode.off) return;
+     if (_busy) {
+     schedule();
+     return;
+     }
+     _busy = true;
+     final gen = ++_gen;
+     try {
+     final source = _source(m);
+     if (source == null) {
+     final lang = articleLang.value;
+     status.value = lang == 'korean'
+     ? '이미 한국어 작품이에요'
+     : '${koName(lang)}는 아직 글자 읽기를 지원하지 않아요. 아래 버튼으로 언어를 골라 보세요';
+     return;
+     }
+     final (script, code) = source;
+     final ro = activeKey?.currentContext?.findRenderObject();
+     if (ro is! RenderRepaintBoundary) return;
+     status.value = '번역 중...';
+     final image = await ro.toImage(pixelRatio: dpr);
+     final data = await image.toByteData(format: ui.ImageByteFormat.png);
+     image.dispose();
+     if (data == null || gen != _gen) return;
+     final dir = await getTemporaryDirectory();
+     final file = File('${dir.path}/violet_translate_capture.png');
+     await file.writeAsBytes(data.buffer.asUint8List(), flush: true);
+     if (gen != _gen) return;
+     final recognized = await _getRecognizer(
+     script,
+     ).processImage(InputImage.fromFilePath(file.path));
+     if (gen != _gen) return;
+     final translator = await _getTranslator(code);
+     if (gen != _gen) return;
+     final out = <MangaTranslateBox>[];
+     for (final block in recognized.blocks) {
+     final src = _prepare(block.text, script);
+     if (src == null) continue;
+     final key = '$code|$src';
+     var ko = _cache[key];
+     if (ko == null) {
+     ko = await translator.translateText(src);
+     _cache[key] = ko;
+     }
+     if (gen != _gen) return;
+     final r = block.boundingBox;
+     out.add(
+     MangaTranslateBox(
+     Rect.fromLTRB(r.left / dpr, r.top / dpr, r.right / dpr, r.bottom / dpr),
+     ko,
+     ),
+     );
+     }
+     boxes.value = out;
+     status.value = out.isEmpty ? '번역할 글자를 못 찾았어요' : '';
+     } catch (e) {
+     if (gen == _gen) status.value = '번역 실패: $e';
+     } finally {
+     _busy = false;
+     }
+     }
+     }
+     class MangaTranslateLayer extends StatefulWidget {
+     const MangaTranslateLayer({super.key, required this.child});
+     final Widget child;
+     @override
+     State<MangaTranslateLayer> createState() => _MangaTranslateLayerState();
+     }
+     class _MangaTranslateLayerState extends State<MangaTranslateLayer> {
+     final MangaTranslate t = MangaTranslate.instance;
+     final GlobalKey _key = GlobalKey();
+     @override
+     void initState() {
+     super.initState();
+     t.activeKey = _key;
+     t.schedule(const Duration(milliseconds: 1200));
+     }
+     @override
+     void didChangeDependencies() {
+     super.didChangeDependencies();
+     try {
+     t.setArticle(Provider.of<ViewerPageProvider>(context, listen: false).id);
+     } catch (_) {}
+     }
+     @override
+     void dispose() {
+     t.hide();
+     if (identical(t.activeKey, _key)) t.activeKey = null;
+     super.dispose();
+     }
+     Widget _box(MangaTranslateBox b) {
+     final w = max(b.rect.width, 96.0);
+     final h = max(b.rect.height, 30.0);
+     return Positioned(
+     left: b.rect.center.dx - w / 2,
+     top: b.rect.center.dy - h / 2,
+     width: w,
+     height: h,
+     child: Container(
+     padding: const EdgeInsets.all(3),
+     alignment: Alignment.center,
+     decoration: BoxDecoration(
+     color: const Color(0xF2FFFFFF),
+     borderRadius: BorderRadius.circular(6),
+     border: Border.all(color: const Color(0x33000000)),
+     ),
+     child: FittedBox(
+     fit: BoxFit.scaleDown,
+     child: ConstrainedBox(
+     constraints: BoxConstraints(maxWidth: w - 6),
+     child: Text(
+     b.text,
+     textAlign: TextAlign.center,
+     style: const TextStyle(
+     color: Colors.black,
+     fontSize: 13,
+     height: 1.25,
+     fontWeight: FontWeight.w600,
+     ),
+     ),
+     ),
+     ),
+     ),
+     );
+     }
+     @override
+     Widget build(BuildContext context) {
+     t.activeKey = _key;
+     t.dpr = MediaQuery.of(context).devicePixelRatio;
+     return Stack(
+     fit: StackFit.expand,
+     children: [
+     Listener(
+     onPointerDown: (_) => t.hide(),
+     onPointerUp: (_) => t.schedule(),
+     child: NotificationListener<ScrollNotification>(
+     onNotification: (n) {
+     if (n is ScrollUpdateNotification) t.hide();
+     if (n is ScrollEndNotification) t.schedule();
+     return false;
+     },
+     child: RepaintBoundary(key: _key, child: widget.child),
+     ),
+     ),
+     IgnorePointer(
+     child: ValueListenableBuilder<List<MangaTranslateBox>>(
+     valueListenable: t.boxes,
+     builder: (context, boxes, _) => Stack(
+     children: [for (final b in boxes) _box(b)],
+     ),
+     ),
+     ),
+     ],
+     );
+     }
+     }
+     class MangaTranslateButton extends StatelessWidget {
+     const MangaTranslateButton({super.key});
+     static String _label(MangaTranslateMode m, String lang) => switch (m) {
+     MangaTranslateMode.off => '번역 끔',
+     MangaTranslateMode.auto =>
+     lang.isEmpty ? '번역: 자동' : '번역: 자동 (${MangaTranslate.koName(lang)})',
+     MangaTranslateMode.japanese => '번역: 일본어',
+     MangaTranslateMode.chinese => '번역: 중국어',
+     MangaTranslateMode.english => '번역: 영어',
+     };
+     @override
+     Widget build(BuildContext context) {
+     final t = MangaTranslate.instance;
+     return Positioned(
+     left: 10,
+     bottom: 10 + MediaQuery.of(context).padding.bottom,
+     child: ListenableBuilder(
+     listenable: Listenable.merge([t.mode, t.articleLang]),
+     builder: (context, _) => _content(t, t.mode.value, t.articleLang.value),
+     ),
+     );
+     }
+     Widget _content(MangaTranslate t, MangaTranslateMode m, String lang) {
+     return Column(
+     mainAxisSize: MainAxisSize.min,
+     crossAxisAlignment: CrossAxisAlignment.start,
+     children: [
+     ValueListenableBuilder<String>(
+     valueListenable: t.status,
+     builder: (context, s, _) => s.isEmpty || m == MangaTranslateMode.off
+     ? const SizedBox.shrink()
+     : Container(
+     margin: const EdgeInsets.only(bottom: 6),
+     padding: const EdgeInsets.symmetric(
+     horizontal: 8,
+     vertical: 4,
+     ),
+     constraints: const BoxConstraints(maxWidth: 260),
+     decoration: BoxDecoration(
+     color: const Color(0xB3000000),
+     borderRadius: BorderRadius.circular(8),
+     ),
+     child: Text(
+     s,
+     style: const TextStyle(
+     color: Colors.white,
+     fontSize: 12,
+     ),
+     ),
+     ),
+     ),
+     GestureDetector(
+     onTap: t.cycle,
+     child: Container(
+     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+     decoration: BoxDecoration(
+     color: m == MangaTranslateMode.off
+     ? const Color(0x80000000)
+     : const Color(0xE62196F3),
+     borderRadius: BorderRadius.circular(18),
+     ),
+     child: Text(
+     _label(m, lang),
+     style: const TextStyle(
+     color: Colors.white,
+     fontSize: 12,
+     fontWeight: FontWeight.w600,
+     ),
+     ),
+     ),
+     ),
+     ],
+     );
+     }
+     }
+     DART
+     python3 - <<'PY'
+     import sys
+
+
+     def patch(path, old, new, done_marker):
+         s = open(path, encoding='utf-8').read()
+         if done_marker in s:
+             print(path, 'already patched')
+             return
+         if s.count(old) != 1:
+             sys.exit('patch anchor not found in ' + path)
+         open(path, 'w', encoding='utf-8').write(s.replace(old, new))
+         print(path, 'patched')
+
+
+     # 1) 라이브러리 추가 (글자 읽기 + 번역)
+     patch(
+         'pubspec.yaml',
+         '  path_provider: ^2.1.4\n',
+         '  path_provider: ^2.1.4\n'
+         '  google_mlkit_text_recognition: any\n'
+         '  google_mlkit_translation: any\n',
+         'google_mlkit_translation',
+     )
+
+     # 2) 일본어/중국어 글자 읽기 모델
+     g = 'android/app/build.gradle.kts'
+     s = open(g, encoding='utf-8').read()
+     if 'text-recognition-japanese' not in s:
+         s = s.rstrip() + '\n\ndependencies {\n' \
+             '    implementation("com.google.mlkit:text-recognition-japanese:16.0.1")\n' \
+             '    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")\n' \
+             '}\n'
+         open(g, 'w', encoding='utf-8').write(s)
+         print(g, 'patched')
+
+     # 3) 안 쓰는 언어 모델(데바나가리/한국어) 경고 무시
+     p = 'android/app/proguard-rules.pro'
+     s = open(p, encoding='utf-8').read()
+     if 'com.google.mlkit.vision.text' not in s:
+         s = s.rstrip() + '\n\n-dontwarn com.google.mlkit.vision.text.**\n'
+         open(p, 'w', encoding='utf-8').write(s)
+         print(p, 'patched')
+
+     # 4) 뷰어에 번역 레이어와 버튼 붙이기
+     v = 'lib/pages/viewer/viewer_page.dart'
+     patch(
+         v,
+         "import 'package:violet/settings/settings.dart';\n",
+         "import 'package:violet/pages/viewer/translate/manga_translate.dart';\n"
+         "import 'package:violet/settings/settings.dart';\n",
+         'manga_translate.dart',
+     )
+     s = open(v, encoding='utf-8').read()
+     old = (
+         "          if (c.viewType.value == ViewType.horizontal)\n"
+         "            HorizontalViewerPage(getxId: getxId)\n"
+         "          else\n"
+         "            VerticalViewerPage(getxId: getxId),\n"
+         "          ViewerOverlay(getxId: getxId),\n"
+     )
+     new = (
+         "          MangaTranslateLayer(\n"
+         "            child: c.viewType.value == ViewType.horizontal\n"
+         "                ? HorizontalViewerPage(getxId: getxId)\n"
+         "                : VerticalViewerPage(getxId: getxId),\n"
+         "          ),\n"
+         "          ViewerOverlay(getxId: getxId),\n"
+         "          const MangaTranslateButton(),\n"
+     )
+     if 'MangaTranslateLayer(' not in s:
+         if s.count(old) != 1:
+             sys.exit('viewer stack anchor not found')
+         open(v, 'w', encoding='utf-8').write(s.replace(old, new))
+         print(v, 'stack patched')
+     PY
+  - uses: actions/setup-java@v4
+    with:
+     distribution: temurin
+     java-version: "17"
+  - uses: subosito/flutter-action@v2
+    with:
+     channel: stable
+     flutter-version: 3.35.4
+  - uses: dtolnay/rust-toolchain@stable
+  - name: Stub server salt files
+    run: |
+     echo 'String getValid(String vToken) { return vToken; }' > lib/server/salt.dart
+     echo 'String getValid(String vToken) { return vToken; }' > lib/server/wsalt.dart
+  - name: Restore signing key
+    id: keycache
+    uses: actions/cache@v4
+    with:
+     path: violet/android/build-key.jks
+     key: violet-build-key-v1
+  - name: Create signing key (first time only)
+    if: steps.keycache.outputs.cache-hit != 'true'
+    run: |
+     keytool -genkeypair -keystore android/build-key.jks -storepass violetlite -keypass violetlite -alias violet -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Violet Lite Custom"
+  - name: Write key.properties
+    run: |
+     printf 'storePassword=violetlite\nkeyPassword=violetlite\nkeyAlias=violet\nstoreFile=%s\n' "$GITHUB_WORKSPACE/violet/android/build-key.jks" > android/key.properties
+  - name: Build APK (arm64)
+    run: |
+     flutter pub get
+     flutter build apk --release --target-platform android-arm64
+  - name: Publish APK to Releases
+    env:
+     GH_TOKEN: ${{ github.token }}
+    run: |
+     cp build/app/outputs/flutter-apk/app-release.apk violet-ai.apk
+     gh release delete ai-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+     gh release create ai-latest violet-ai.apk --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Violet AI 추천 + 번역 (최신)" --notes "빌드 번호 $GITHUB_RUN_NUMBER"
